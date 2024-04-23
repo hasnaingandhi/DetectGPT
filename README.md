@@ -1,0 +1,2 @@
+# DetectGPT
+NLP Term Project
