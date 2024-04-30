@@ -7,6 +7,7 @@ from transformers.utils import logging
 import torch
 import time
 import datasets
+from transformers import BitsAndBytesConfig
 
 
 API_TOKEN_COUNTER = 0
@@ -14,7 +15,7 @@ DEVICE = "cuda"
 
 def create_save_folder(args, start_time):
     base_model_name = args.base_model.replace('/', '_')
-    save_folder_name = f"results/{args.output_name}{base_model_name}-{args.mask_filling_model}/{start_time}-{args.pct_words_masked}-{args.n_perturbation_rounds}-{args.dataset}-{args.n_samples}"
+    save_folder_name = f"results/{args.output_name}{base_model_name}-{args.mask_filling_model}/{start_time}-{args.pct_words_masked}-{args.n_perturbation_list}-{args.dataset}-{args.n_samples}"
     if not os.path.exists(save_folder_name):
         os.makedirs(save_folder_name)
     logger.info(f"Saving results to path: {os.path.abspath(save_folder_name)}")
@@ -40,13 +41,40 @@ def get_base_model(model_name, cache_dir):
 
     return base_model, base_tokenizer
 
-def load_base_model():
+def load_base_model(base_model):
     logger.info("Moving Base Model to GPU...", end='', flush=True)
     start = time.time()
     base_model.to(DEVICE)
     logger.info(f'Done ({time.time() - start:.2f}s)')
 
+def load_dataset(dataset, dataset_key):
+    data = generate_data(dataset, dataset_key)
+    if args.random_fills:
+        FILL_DICTIONARY = set()
+        for texts in data.values():
+            for text in texts:
+                FILL_DICTIONARY.update(text.split())
+        FILL_DICTIONARY = sorted(list(FILL_DICTIONARY))
 
+    with open(os.path.join(SAVE_FOLDER, "raw_data.json"), "w") as f:
+        print(f"Writing raw data to {os.path.join(SAVE_FOLDER, 'raw_data.json')}")
+        json.dump(data, f)
+
+    
+def baseline_outputs():
+    baseline_outputs = [run_baseline_threshold_experiment(get_ll, "likelihood", n_samples=n_samples)]
+        
+    rank_criterion = lambda text: -get_rank(text, log=False)
+    baseline_outputs.append(run_baseline_threshold_experiment(rank_criterion, "rank", n_samples=n_samples))
+    logrank_criterion = lambda text: -get_rank(text, log=True)
+    baseline_outputs.append(run_baseline_threshold_experiment(logrank_criterion, "log_rank", n_samples=n_samples))
+    entropy_criterion = lambda text: get_entropy(text)
+    baseline_outputs.append(run_baseline_threshold_experiment(entropy_criterion, "entropy", n_samples=n_samples))
+
+    baseline_outputs.append(eval_supervised(data, model='roberta-base-openai-detector'))
+    baseline_outputs.append(eval_supervised(data, model='roberta-large-openai-detector'))
+
+    
 
 if __name__ == '__main__':
     logging.set_verbosity_info()
@@ -91,19 +119,27 @@ if __name__ == '__main__':
     
     GPT2_TOKENIZER = transformers.GPT2Tokenizer.from_pretrained('gpt2', cache_dir=args.cache_dir)
 
-    # considering only baselines and random fills
-    #considering int8
-    kwargs = dict(load_in_8bit=True, device_map="auto", torch_dtype=torch.bfloat16)
-    logger.info(f'Loading mask filling model {args.mask_filling_model}')
-    
-    # use sequence-to-sequence LM since we want to map the input text to a masked output text
-    # mask_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(args.mask_filling_model, **kwargs, cache_dir=args.cache_dir)
+
+    ######################################
+    print("mask model")
+    # Quantization configuration
+    # quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+
+    # Load the model with quantization
+    # mask_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(args.mask_filling_model, quantization_config=quantization_config, device_map="auto", torch_dtype=torch.bfloat16, cache_dir=args.cache_dir)
+
+    mask_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(args.mask_filling_model)
+
+    print("done")
+    #####################################
     
     pre_tokenizer = transformers.AutoTokenizer.from_pretrained("t5-small", model_max_length=256, cache_dir=args.cache_dir)
     mask_tokenizer = transformers.AutoTokenizer.from_pretrained(args.mask_filling_model, model_max_length=256, cache_dir=args.cache_dir)
 
     load_base_model(base_model)
 
-    
+    print(f'Loading dataset {args.dataset}...')
 
-    
+    load_dataset(dataset, dataset_key)
+
+    print("Dataset loaded")
