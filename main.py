@@ -10,6 +10,8 @@ import datasets
 from transformers import BitsAndBytesConfig
 import random
 import numpy as np
+import tqdm
+from sklearn.metrics import roc_curve, precision_recall_curve, auc
 
 
 API_TOKEN_COUNTER = 0
@@ -18,13 +20,13 @@ MODEL_MAX_LENGTH = 512
 MIN_WORDS_SAMPLED = 55
 TOP_K = 30
 SAVE_FOLDER_NAME = ''
+MIN_EXAMPLE_WORDS = 250
 
 def save_temp_results(data):
     # Open file in write mode
     with open(os.path.join(SAVE_FOLDER_NAME, "temp_data.json"), "w") as file:
         # Write each item in the dataset to the file
-        for item in data:
-            file.write(item + "\n")  # Add a newline character after each item
+        json.dump(data, file)
 
 def create_save_folder(args, start_time):
     base_model_name = args.base_model.replace('/', '_')
@@ -57,6 +59,10 @@ def get_base_model(model_name, cache_dir):
 def load_base_model(base_model):
     logger.info("Moving Base Model to GPU...", end='', flush=True)
     start = time.time()
+    try:
+        mask_model.cpu()
+    except NameError:
+        pass
     base_model.to(DEVICE)
     logger.info(f'Done ({time.time() - start:.2f}s)')
 
@@ -83,13 +89,15 @@ def sample_from_model(texts, min_words=55, prompt_tokens=30):
         # for top_k sampling
         sampling_kwargs['top_k'] = TOP_K
         min_length = 150
+        torch.cuda.empty_cache()
         outputs = base_model.generate(**encoded_text, min_length=min_length, max_length=200, do_sample=True, **sampling_kwargs, pad_token_id=base_tokenizer.eos_token_id, eos_token_id=base_tokenizer.eos_token_id)
         decoded_text = base_tokenizer.batch_decode(outputs, skip_special_tokens=True)
         tries += 1
 
     return decoded_text
 
-def get_samples(data, batch_size):
+def get_samples(raw, batch_size):
+    # torch.cuda.empty_cache()
     # GENERATE SAMPLES
     logger.info(f"Generating samples...")
     torch.manual_seed(31)
@@ -98,9 +106,9 @@ def get_samples(data, batch_size):
         "original": [],
         "sampled": [],
     }
-    for batch in range(len(data) // batch_size):
-        logger.info(f"Generating samples for batch {batch} of {len(data) // batch_size}")
-        original = data[batch*batch_size: (batch+1)*batch_size]
+    for batch in range(len(raw) // batch_size):
+        logger.info(f"Generating samples for batch {batch} of {len(raw) // batch_size}")
+        original = raw[batch*batch_size: (batch+1)*batch_size]
         sampled = sample_from_model(original, min_words=MIN_WORDS_SAMPLED)
 
         for o, s in zip(original, sampled):
@@ -127,7 +135,7 @@ def get_data(dataset, key, pre_tokenizer, batch_size, cache_dir):
 
     # Keep sufficiently long examples
     if dataset=='xsum' :
-        long_samples = [x for x in data if len(x.split()) > 250]
+        long_samples = [x for x in data if len(x.split()) > MIN_EXAMPLE_WORDS]
         if len(long_samples) > 0:
             data = long_samples
 
@@ -145,12 +153,11 @@ def get_data(dataset, key, pre_tokenizer, batch_size, cache_dir):
 
 
 def load_dataset(dataset, dataset_key, pre_tokenizer, batch_size, cache_dir):
-    data = get_data(args.dataset,
+    data = get_data(dataset,
                     key=dataset_key,
                     pre_tokenizer=pre_tokenizer,
                     batch_size=args.batch_size,
                     cache_dir=args.cache_dir)
-    save_temp_results(data)
     if args.random_fills:
         FILL_DICTIONARY = set()
         for texts in data.values():
@@ -161,22 +168,106 @@ def load_dataset(dataset, dataset_key, pre_tokenizer, batch_size, cache_dir):
     with open(os.path.join(SAVE_FOLDER_NAME, "raw_data.json"), "w") as f:
         logger.warning(f"Writing raw data to {os.path.join(SAVE_FOLDER_NAME, 'raw_data.json')}")
         json.dump(data, f)
-
     
+    return data
+
+
+def compute_ll(text):
+    # consider non-openai model
+    with torch.no_grad():
+        tokenized = base_tokenizer(text, return_tensors="pt").to(DEVICE)
+        labels = tokenized.input_ids
+        return -base_model(**tokenized, labels=labels).loss.item()
+    
+def compute_rank(text, log=False):
+    # consider non-openai model
+
+    with torch.no_grad():
+        tokenized = base_tokenizer(text, return_tensors="pt").to(DEVICE)
+        logits = base_model(**tokenized).logits[:, :-1]
+        labels = tokenized.input_ids[:, 1:]
+
+        # get rank of each label token in the model's likelihood ordering
+        matches = (logits.argsort(-1, descending=True) == labels.unsqueeze(-1)).nonzero()
+
+        assert matches.shape[1] == 3, f"Expected 3 dimensions in matches tensor, got {matches.shape}"
+
+        ranks, timesteps = matches[:,-1], matches[:,-2]
+
+        # make sure we got exactly one match for each timestep in the sequence
+        assert (timesteps == torch.arange(len(timesteps)).to(timesteps.device)).all(), "Expected one match per timestep"
+
+        ranks = ranks.float() + 1 # convert to 1-indexed rank
+        if log:
+            ranks = torch.log(ranks)
+
+        return ranks.float().mean().item()
+    
+def get_roc_metrics(real_preds, sample_preds):
+    fpr, tpr, _ = roc_curve([0] * len(real_preds) + [1] * len(sample_preds), real_preds + sample_preds)
+    roc_auc = auc(fpr, tpr)
+    return fpr.tolist(), tpr.tolist(), float(roc_auc)
+
+def get_precision_recall_metrics(real_preds, sample_preds):
+    precision, recall, _ = precision_recall_curve([0] * len(real_preds) + [1] * len(sample_preds), real_preds + sample_preds)
+    pr_auc = auc(recall, precision)
+    return precision.tolist(), recall.tolist(), float(pr_auc)
+
+
+def baseline_experiment(criterion_func, name, n_samples=100):
+    torch.manual_seed(1)
+    np.random.seed(1)
+
+    experiment_results = []
+    for batch in tqdm.tqdm(range(n_samples // args.batch_size)):
+        logger.warning(f"Computing {name} criterion")
+        original_text = processed_data["original"][batch * args.batch_size:(batch + 1) * args.batch_size]
+        sampled_text = processed_data["sampled"][batch * args.batch_size:(batch + 1) * args.batch_size]
+
+        for idx in range(len(original_text)):
+            experiment_results.append({
+                "original": original_text[idx],
+                "original_criterion": criterion_func(original_text[idx]),
+                "sampled": sampled_text[idx],
+                "sampled_criterion": criterion_func(sampled_text[idx])
+            })
+    # compute prediction scores for real/sampled passages
+    predictions = {
+        'real': [x["original_criterion"] for x in experiment_results],
+        'samples': [x["sampled_criterion"] for x in experiment_results],
+    }
+
+    fpr, tpr, roc_auc = get_roc_metrics(predictions['real'], predictions['samples'])
+    p, r, pr_auc = get_precision_recall_metrics(predictions['real'], predictions['samples'])
+    print(f"{name}_threshold ROC AUC: {roc_auc}, PR AUC: {pr_auc}")
+    return {
+        'name': f'{name}_threshold',
+        'predictions': predictions,
+        'info': {
+            'n_samples': n_samples,
+        },
+        'raw_results': experiment_results,
+        'metrics': {
+            'roc_auc': roc_auc,
+            'fpr': fpr,
+            'tpr': tpr,
+        },
+        'pr_metrics': {
+            'pr_auc': pr_auc,
+            'precision': p,
+            'recall': r,
+        },
+        'loss': 1 - pr_auc,
+    }
+    
+
 def baseline_outputs():
-    baseline_outputs = [run_baseline_threshold_experiment(get_ll, "likelihood", n_samples=n_samples)]
-        
-    rank_criterion = lambda text: -get_rank(text, log=False)
-    baseline_outputs.append(run_baseline_threshold_experiment(rank_criterion, "rank", n_samples=n_samples))
-    logrank_criterion = lambda text: -get_rank(text, log=True)
-    baseline_outputs.append(run_baseline_threshold_experiment(logrank_criterion, "log_rank", n_samples=n_samples))
-    entropy_criterion = lambda text: get_entropy(text)
-    baseline_outputs.append(run_baseline_threshold_experiment(entropy_criterion, "entropy", n_samples=n_samples))
-
-    baseline_outputs.append(eval_supervised(data, model='roberta-base-openai-detector'))
-    baseline_outputs.append(eval_supervised(data, model='roberta-large-openai-detector'))
-
-    
+    if not args.skip_baselines:
+        outputs = [baseline_experiment(compute_ll, "log_likelihood", n_samples=args.n_samples)]
+            
+        get_rank = lambda text: -compute_rank(text, log=False)
+        outputs.append(baseline_experiment(get_rank, "rank", n_samples=args.n_samples))
+    return outputs
 
 if __name__ == '__main__':
     logging.set_verbosity_warning()
@@ -189,24 +280,27 @@ if __name__ == '__main__':
     parser.add_argument('--pct-words-masked', type=float, default=0.3) # pct masked is actually pct_words_masked * (span_length / (span_length + 2 * buffer_size))
     parser.add_argument('--span-length', type=int, default=2)
     parser.add_argument('--n-samples', type=int, default=100)
+    parser.add_argument('--int8', action='store_true')
     parser.add_argument('--n-perturbation-list', type=str, default="1,10")
     parser.add_argument('--base-model', type=str, default="gpt2-medium")
     parser.add_argument('--mask-filling-model', type=str, default="t5-large")
-    parser.add_argument('--batch-size', type=int, default=50)
+    parser.add_argument('--batch-size', type=int, default=10)
     parser.add_argument('--chunk-size', type=int, default=20)
     parser.add_argument('--cache-dir', type=str, default=".cache")
     parser.add_argument('--output-name', type=str, default="n_perturb")
     parser.add_argument('--baseline-only', action='store_true')
     parser.add_argument('--random-fills', action='store_true')
+    parser.add_argument('--skip-baselines', action='store_true')
     args = parser.parse_args()
 
-    logger.info(args.dataset)
-    logger.info(args.mask_filling_model)
-    logger.info(args.n_perturbation_list)
+    logger.warning(args.dataset)
+    logger.warning(args.baseline_only)
+    logger.warning(args.random_fills)
+    logger.warning(args.int8)
 
-    # torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
 
-    # considering int8 precision 
+    # considering fp16 precision 
     # considering top-k sampling for text generation
 
     formatted_start_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -226,6 +320,8 @@ if __name__ == '__main__':
 
     ######################################
     logger.warning("mask model")
+    int8_kwargs = {}
+    half_kwargs = dict(torch_dtype=torch.bfloat16)
     # Quantization configuration
     # quantization_config = BitsAndBytesConfig(load_in_8bit=True)
 
@@ -233,30 +329,36 @@ if __name__ == '__main__':
     # mask_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(args.mask_filling_model, quantization_config=quantization_config, device_map="auto", torch_dtype=torch.bfloat16, cache_dir=args.cache_dir)
 
     # mask_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(args.mask_filling_model)
+    mask_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(args.mask_filling_model, **int8_kwargs, **half_kwargs, cache_dir=args.cache_dir)
+    try:
+        n_positions = mask_model.config.n_positions
+    except AttributeError:
+        n_positions = MODEL_MAX_LENGTH
 
     logger.warning("done")
     #####################################
     
-    # considering only baselines and random fills
-    #considering int8
-    kwargs = dict(load_in_8bit=True, device_map="auto", torch_dtype=torch.bfloat16)
     logger.warning(f'Loading mask filling model {args.mask_filling_model}')
     
     # use sequence-to-sequence LM since we want to map the input text to a masked output text
     # mask_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(args.mask_filling_model, **kwargs, cache_dir=args.cache_dir)
     
     pre_tokenizer = transformers.AutoTokenizer.from_pretrained("t5-small", model_max_length=MODEL_MAX_LENGTH, cache_dir=args.cache_dir)
-    mask_tokenizer = transformers.AutoTokenizer.from_pretrained(args.mask_filling_model, model_max_length=256, cache_dir=args.cache_dir)
+    mask_tokenizer = transformers.AutoTokenizer.from_pretrained(args.mask_filling_model, model_max_length=n_positions, cache_dir=args.cache_dir)
 
     load_base_model(base_model)
+    torch.cuda.empty_cache()
 
     logger.warning(f'Loading dataset {args.dataset}...')
 
-    load_dataset(args.dataset,
-                 args.dataset_key,
-                 pre_tokenizer=pre_tokenizer,
-                 batch_size=args.batch_size,
-                 cache_dir=args.cache_dir
-                )
-
+    processed_data = load_dataset(args.dataset,
+                                    args.dataset_key,
+                                    pre_tokenizer=pre_tokenizer,
+                                    batch_size=args.batch_size,
+                                    cache_dir=args.cache_dir
+                                    )
+    torch.cuda.empty_cache()
     logger.warning("Dataset loaded")
+
+    base_outputs = baseline_outputs()
+    save_temp_results(base_outputs)
