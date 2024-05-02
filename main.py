@@ -8,10 +8,23 @@ import torch
 import time
 import datasets
 from transformers import BitsAndBytesConfig
+import random
+import numpy as np
 
 
 API_TOKEN_COUNTER = 0
 DEVICE = "cuda"
+MODEL_MAX_LENGTH = 512
+MIN_WORDS_SAMPLED = 55
+TOP_K = 30
+SAVE_FOLDER_NAME = ''
+
+def save_temp_results(data):
+    # Open file in write mode
+    with open(os.path.join(SAVE_FOLDER_NAME, "temp_data.json"), "w") as file:
+        # Write each item in the dataset to the file
+        for item in data:
+            file.write(item + "\n")  # Add a newline character after each item
 
 def create_save_folder(args, start_time):
     base_model_name = args.base_model.replace('/', '_')
@@ -47,8 +60,97 @@ def load_base_model(base_model):
     base_model.to(DEVICE)
     logger.info(f'Done ({time.time() - start:.2f}s)')
 
-def load_dataset(dataset, dataset_key):
-    data = generate_data(dataset, dataset_key)
+def trim_to_shortest(text1, text2):
+    shorter = min(len(text1.split(' ')), len(text2.split(' ')))
+    text1 = " ".join(text1.split(' ')[:shorter])
+    text2 = " ".join(text2.split(' ')[:shorter])
+    return text1, text2
+
+def sample_from_model(texts, min_words=55, prompt_tokens=30):
+    encoded_text = base_tokenizer(texts, return_tensors="pt", padding=True).to(DEVICE)
+    encoded_text = {key: value[:, : prompt_tokens] for key,value in encoded_text.items()}
+    decoded_text = ['' for _ in range(len(texts))]
+
+    # sample from the model until we get a sample with at least min_words words for each example
+    # TODO this is an inefficient way to do this (since we regenerate for all inputs if just one is too short), but it works
+
+    tries = 0
+    while(m := min(len(x.split()) for x in decoded_text)) < min_words:
+        if tries != 0:
+            logger.warn(f"\nmin words: {m}, needed {min_words}, regenerating (try {tries})")
+        
+        sampling_kwargs = {}
+        # for top_k sampling
+        sampling_kwargs['top_k'] = TOP_K
+        min_length = 150
+        outputs = base_model.generate(**encoded_text, min_length=min_length, max_length=200, do_sample=True, **sampling_kwargs, pad_token_id=base_tokenizer.eos_token_id, eos_token_id=base_tokenizer.eos_token_id)
+        decoded_text = base_tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        tries += 1
+
+    return decoded_text
+
+def get_samples(data, batch_size):
+    # GENERATE SAMPLES
+    logger.info(f"Generating samples...")
+    torch.manual_seed(31)
+    np.random.seed(31)
+    data = {
+        "original": [],
+        "sampled": [],
+    }
+    for batch in range(len(data) // batch_size):
+        logger.info(f"Generating samples for batch {batch} of {len(data) // batch_size}")
+        original = data[batch*batch_size: (batch+1)*batch_size]
+        sampled = sample_from_model(original, min_words=MIN_WORDS_SAMPLED)
+
+        for o, s in zip(original, sampled):
+            o, s = trim_to_shortest(o, s)
+            data["original"].append(o)
+            data["sampled"].append(s)
+
+    # TODO Introduce pre-perturbations
+
+    return data
+
+def get_data(dataset, key, pre_tokenizer, batch_size, cache_dir):
+    data = datasets.load_dataset(dataset, split="train", cache_dir=cache_dir)[key]
+
+    # PREPROCESS
+    # remove duplicates
+    data = list(dict.fromkeys(data))
+
+    # remove new lines
+    data = [' '.join(x.split()) for x in data]
+
+    # remove surrounding whitespace
+    data = [x.strip() for x in data]
+
+    # Keep sufficiently long examples
+    if dataset=='xsum' :
+        long_samples = [x for x in data if len(x.split()) > 250]
+        if len(long_samples) > 0:
+            data = long_samples
+
+    random.seed(1)
+    random.shuffle(data)
+    data = data[:1000]
+
+    tokenized_data = pre_tokenizer(data)
+    data = [x for x, y in zip(data, tokenized_data["input_ids"]) if len(y) <= MODEL_MAX_LENGTH]
+
+    logger.warning(f"Total number of samples: {len(data)}")
+    logger.warning(f"Avg number of words: {np.mean([len(x.split()) for x in data])}")
+
+    return get_samples(data[:args.n_samples], batch_size=batch_size)
+
+
+def load_dataset(dataset, dataset_key, pre_tokenizer, batch_size, cache_dir):
+    data = get_data(args.dataset,
+                    key=dataset_key,
+                    pre_tokenizer=pre_tokenizer,
+                    batch_size=args.batch_size,
+                    cache_dir=args.cache_dir)
+    save_temp_results(data)
     if args.random_fills:
         FILL_DICTIONARY = set()
         for texts in data.values():
@@ -56,8 +158,8 @@ def load_dataset(dataset, dataset_key):
                 FILL_DICTIONARY.update(text.split())
         FILL_DICTIONARY = sorted(list(FILL_DICTIONARY))
 
-    with open(os.path.join(SAVE_FOLDER, "raw_data.json"), "w") as f:
-        print(f"Writing raw data to {os.path.join(SAVE_FOLDER, 'raw_data.json')}")
+    with open(os.path.join(SAVE_FOLDER_NAME, "raw_data.json"), "w") as f:
+        logger.warning(f"Writing raw data to {os.path.join(SAVE_FOLDER_NAME, 'raw_data.json')}")
         json.dump(data, f)
 
     
@@ -77,11 +179,13 @@ def baseline_outputs():
     
 
 if __name__ == '__main__':
-    logging.set_verbosity_info()
+    logging.set_verbosity_warning()
+    logging.enable_explicit_format
     logger = logging.get_logger("transformers")
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', type=str, default="xsum")
+    parser.add_argument('--dataset_key', type=str, default="document")
     parser.add_argument('--pct-words-masked', type=float, default=0.3) # pct masked is actually pct_words_masked * (span_length / (span_length + 2 * buffer_size))
     parser.add_argument('--span-length', type=int, default=2)
     parser.add_argument('--n-samples', type=int, default=100)
@@ -108,9 +212,9 @@ if __name__ == '__main__':
     formatted_start_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # save folder for results - 
-    save_folder_name = create_save_folder(args, formatted_start_time)
+    SAVE_FOLDER_NAME = create_save_folder(args, formatted_start_time)
 
-    with open(os.path.join(save_folder_name, "arguments.json"), "w") as f:
+    with open(os.path.join(SAVE_FOLDER_NAME, "arguments.json"), "w") as f:
         json.dump(args.__dict__, f, indent=2)
 
     setup_cache(args)
@@ -121,25 +225,38 @@ if __name__ == '__main__':
 
 
     ######################################
-    print("mask model")
+    logger.warning("mask model")
     # Quantization configuration
     # quantization_config = BitsAndBytesConfig(load_in_8bit=True)
 
     # Load the model with quantization
     # mask_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(args.mask_filling_model, quantization_config=quantization_config, device_map="auto", torch_dtype=torch.bfloat16, cache_dir=args.cache_dir)
 
-    mask_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(args.mask_filling_model)
+    # mask_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(args.mask_filling_model)
 
-    print("done")
+    logger.warning("done")
     #####################################
     
-    pre_tokenizer = transformers.AutoTokenizer.from_pretrained("t5-small", model_max_length=256, cache_dir=args.cache_dir)
+    # considering only baselines and random fills
+    #considering int8
+    kwargs = dict(load_in_8bit=True, device_map="auto", torch_dtype=torch.bfloat16)
+    logger.warning(f'Loading mask filling model {args.mask_filling_model}')
+    
+    # use sequence-to-sequence LM since we want to map the input text to a masked output text
+    # mask_model = transformers.AutoModelForSeq2SeqLM.from_pretrained(args.mask_filling_model, **kwargs, cache_dir=args.cache_dir)
+    
+    pre_tokenizer = transformers.AutoTokenizer.from_pretrained("t5-small", model_max_length=MODEL_MAX_LENGTH, cache_dir=args.cache_dir)
     mask_tokenizer = transformers.AutoTokenizer.from_pretrained(args.mask_filling_model, model_max_length=256, cache_dir=args.cache_dir)
 
     load_base_model(base_model)
 
-    print(f'Loading dataset {args.dataset}...')
+    logger.warning(f'Loading dataset {args.dataset}...')
 
-    load_dataset(dataset, dataset_key)
+    load_dataset(args.dataset,
+                 args.dataset_key,
+                 pre_tokenizer=pre_tokenizer,
+                 batch_size=args.batch_size,
+                 cache_dir=args.cache_dir
+                )
 
-    print("Dataset loaded")
+    logger.warning("Dataset loaded")
