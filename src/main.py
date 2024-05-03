@@ -13,7 +13,8 @@ import numpy as np
 import tqdm
 from sklearn.metrics import roc_curve, precision_recall_curve, auc
 import functools
-
+import utils
+import loadingdata
 
 API_TOKEN_COUNTER = 0
 DEVICE = "cuda"
@@ -103,80 +104,7 @@ def sample_from_model(texts, min_words=55, prompt_tokens=30):
 
     return decoded_text
 
-def get_samples(raw, batch_size):
-    # torch.cuda.empty_cache()
-    # GENERATE SAMPLES
-    logger.info(f"Generating samples...")
-    torch.manual_seed(31)
-    np.random.seed(31)
-    data = {
-        "original": [],
-        "sampled": [],
-    }
-    for batch in range(len(raw) // batch_size):
-        logger.info(f"Generating samples for batch {batch} of {len(raw) // batch_size}")
-        original = raw[batch*batch_size: (batch+1)*batch_size]
-        sampled = sample_from_model(original, min_words=MIN_WORDS_SAMPLED)
 
-        for o, s in zip(original, sampled):
-            o, s = trim_to_shortest(o, s)
-            data["original"].append(o)
-            data["sampled"].append(s)
-
-    # TODO Introduce pre-perturbations
-
-    return data
-
-def get_data(dataset, key, pre_tokenizer, batch_size, cache_dir):
-    data = datasets.load_dataset(dataset, split="train", cache_dir=cache_dir)[key]
-
-    # PREPROCESS
-    # remove duplicates
-    data = list(dict.fromkeys(data))
-
-    # remove new lines
-    data = [' '.join(x.split()) for x in data]
-
-    # remove surrounding whitespace
-    data = [x.strip() for x in data]
-
-    # Keep sufficiently long examples
-    if dataset=='xsum' :
-        long_samples = [x for x in data if len(x.split()) > MIN_EXAMPLE_WORDS]
-        if len(long_samples) > 0:
-            data = long_samples
-
-    random.seed(1)
-    random.shuffle(data)
-    data = data[:1000]
-
-    tokenized_data = pre_tokenizer(data)
-    data = [x for x, y in zip(data, tokenized_data["input_ids"]) if len(y) <= MODEL_MAX_LENGTH]
-
-    logger.warning(f"Total number of samples: {len(data)}")
-    logger.warning(f"Avg number of words: {np.mean([len(x.split()) for x in data])}")
-
-    return get_samples(data[:args.n_samples], batch_size=batch_size)
-
-
-def load_dataset(dataset, dataset_key, pre_tokenizer, batch_size, cache_dir):
-    data = get_data(dataset,
-                    key=dataset_key,
-                    pre_tokenizer=pre_tokenizer,
-                    batch_size=args.batch_size,
-                    cache_dir=args.cache_dir)
-    if args.random_fills:
-        FILL_DICTIONARY = set()
-        for texts in data.values():
-            for text in texts:
-                FILL_DICTIONARY.update(text.split())
-        FILL_DICTIONARY = sorted(list(FILL_DICTIONARY))
-
-    with open(os.path.join(SAVE_FOLDER_NAME, "raw_data.json"), "w") as f:
-        logger.warning(f"Writing raw data to {os.path.join(SAVE_FOLDER_NAME, 'raw_data.json')}")
-        json.dump(data, f)
-    
-    return data
 
 
 def compute_ll(text):
@@ -296,7 +224,13 @@ def tokenize_and_mask(text, span_length, pct, ceil_pct=False):
             n_masks += 1
 
     num_filled = 0
-    for idx, token
+    for idx, token in enumerate(tokens):
+        if token == mask_string:
+            tokens[idx] = f'<extra_id_{num_filled}>'
+            num_filled += 1
+    assert num_filled == n_masks, f"num_filled {num_filled} != n_masks {n_masks}"
+    text = ' '.join(tokens)
+    return text
 
 
 def apply_perturbations(texts, span_length, pct, ceil_pct):
@@ -408,13 +342,8 @@ if __name__ == '__main__':
     torch.cuda.empty_cache()
 
     logger.warning(f'Loading dataset {args.dataset}...')
-
-    processed_data = load_dataset(args.dataset,
-                                    args.dataset_key,
-                                    pre_tokenizer=pre_tokenizer,
-                                    batch_size=args.batch_size,
-                                    cache_dir=args.cache_dir
-                                    )
+    object_processed_data = loadingdata.Dataset(args, logger, MIN_EXAMPLE_WORDS, MODEL_MAX_LENGTH, SAVE_FOLDER_NAME)
+    processed_data = object_processed_data.dataset_generation(pre_tokenizer=pre_tokenizer)
     torch.cuda.empty_cache()
     logger.warning("Dataset loaded")
 
@@ -423,5 +352,53 @@ if __name__ == '__main__':
 
     if not args.baselines_only:
         # run perturbation experiments
-        for n_perturbations in args.n_perturbation_list:
-            perturbation_results = get_perturbation_results(args.span_length, n_perturbations, n_samples=args.n_samples)
+        for n_perturbations in n_perturbation_list:
+            perturbation_results = get_perturbation_results(args.span_length, n_perturbations, n_samples)
+            for perturbation_mode in ['d', 'z']:
+                output = run_perturbation_experiment(
+                    perturbation_results, perturbation_mode, span_length=args.span_length, n_perturbations=n_perturbations, n_samples=n_samples)
+                outputs.append(output)
+                with open(os.path.join(SAVE_FOLDER, f"perturbation_{n_perturbations}_{perturbation_mode}_results.json"), "w") as f:
+                    json.dump(output, f)
+    torch.cuda.empty_cache()
+    
+    if not args.skip_baselines:
+        # write likelihood threshold results to a file
+        with open(os.path.join(SAVE_FOLDER, f"likelihood_threshold_results.json"), "w") as f:
+            json.dump(baseline_outputs[0], f)
+
+        if args.openai_model is None:
+            # write rank threshold results to a file
+            with open(os.path.join(SAVE_FOLDER, f"rank_threshold_results.json"), "w") as f:
+                json.dump(baseline_outputs[1], f)
+
+            # write log rank threshold results to a file
+            with open(os.path.join(SAVE_FOLDER, f"logrank_threshold_results.json"), "w") as f:
+                json.dump(baseline_outputs[2], f)
+
+            # write entropy threshold results to a file
+            with open(os.path.join(SAVE_FOLDER, f"entropy_threshold_results.json"), "w") as f:
+                json.dump(baseline_outputs[3], f)
+        
+        # write supervised results to a file
+        with open(os.path.join(SAVE_FOLDER, f"roberta-base-openai-detector_results.json"), "w") as f:
+            json.dump(baseline_outputs[-2], f)
+        
+        # write supervised results to a file
+        with open(os.path.join(SAVE_FOLDER, f"roberta-large-openai-detector_results.json"), "w") as f:
+            json.dump(baseline_outputs[-1], f)
+
+        outputs += baseline_outputs
+    torch.cuda.empty_cache()
+    save_roc_curves(outputs)
+    save_ll_histograms(outputs)
+    save_llr_histograms(outputs)
+    torch.cuda.empty_cache()
+
+    # move results folder from tmp_results/ to results/, making sure necessary directories exist
+    new_folder = SAVE_FOLDER.replace("tmp_results", "results")
+    if not os.path.exists(os.path.dirname(new_folder)):
+        os.makedirs(os.path.dirname(new_folder))
+    os.rename(SAVE_FOLDER, new_folder)
+    torch.cuda.empty_cache()
+    print(f"Used an *estimated* {API_TOKEN_COUNTER} API tokens (may be inaccurate)")
