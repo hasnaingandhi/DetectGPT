@@ -12,6 +12,7 @@ import random
 import numpy as np
 import tqdm
 from sklearn.metrics import roc_curve, precision_recall_curve, auc
+import functools
 
 
 API_TOKEN_COUNTER = 0
@@ -22,12 +23,22 @@ TOP_K = 30
 SAVE_FOLDER_NAME = ''
 MIN_EXAMPLE_WORDS = 250
 
+
 def save_temp_results(data):
     # Open file in write mode
     with open(os.path.join(SAVE_FOLDER_NAME, "temp_data.json"), "w") as file:
         # Write each item in the dataset to the file
         json.dump(data, file)
 
+def load_mask_model():
+    logger.warning('Moving mask model to GPU...')
+    start = time.time()
+    # for non-openai models
+    base_model.cpu()
+    if not args.random_fills:
+        mask_model.to(DEVICE)
+    print(f'Done ({time.time() - start:.2f}s)')
+    
 def create_save_folder(args, start_time):
     base_model_name = args.base_model.replace('/', '_')
     save_folder_name = f"results/{args.output_name}{base_model_name}-{args.mask_filling_model}/{start_time}-{args.pct_words_masked}-{args.n_perturbation_list}-{args.dataset}-{args.n_samples}"
@@ -66,11 +77,7 @@ def load_base_model(base_model):
     base_model.to(DEVICE)
     logger.info(f'Done ({time.time() - start:.2f}s)')
 
-def trim_to_shortest(text1, text2):
-    shorter = min(len(text1.split(' ')), len(text2.split(' ')))
-    text1 = " ".join(text1.split(' ')[:shorter])
-    text2 = " ".join(text2.split(' ')[:shorter])
-    return text1, text2
+
 
 def sample_from_model(texts, min_words=55, prompt_tokens=30):
     encoded_text = base_tokenizer(texts, return_tensors="pt", padding=True).to(DEVICE)
@@ -269,6 +276,57 @@ def baseline_outputs():
         outputs.append(baseline_experiment(get_rank, "rank", n_samples=args.n_samples))
     return outputs
 
+def tokenize_and_mask(text, span_length, pct, ceil_pct=False):
+    tokens = text.split(' ')
+    mask_string = '<<<mask>>>'
+
+    n_spans = pct * len(tokens) / (span_length + args.buffer_size * 2)
+    if ceil_pct:
+        n_spans = np.ceil(n_spans)
+    n_spans = int(n_spans)
+
+    n_masks = 0
+    while n_masks < n_spans:
+        start = np.random.randint(0, len(tokens) - span_length)
+        end = start + span_length
+        search_start = max(0, start - args.buffer_size)
+        search_end = min(len(tokens, end + args.buffer_size))
+        if mask_string not in tokens[search_start:search_end]:
+            tokens[start:end] = [mask_string]
+            n_masks += 1
+
+    num_filled = 0
+    for idx, token
+
+
+def apply_perturbations(texts, span_length, pct, ceil_pct):
+    if not args.random_fills:
+        masked_texts = [tokenize_and_mask(x, span_length, pct, ceil_pct) for x in texts]
+        raw_fills = replace_masks(masked_texts)
+        extracted_fills = extract_fills(raw_fills)
+        perturbed_texts = apply_extracted_fills(masked_texts, extracted_fills)
+
+
+def perturb_texts(texts, span_length, pct, ceil_pct=False):
+    outputs = []
+    for i in tqdm.tqdm(range(0, len(texts), args.chunk_size)):
+        logger.warning(f"Applying perturbations where number of perturbations = {n_perturbations}")
+        outputs.extend(apply_perturbations(texts[i:i + args.chunk_size], span_length, pct, ceil_pct=ceil_pct))
+        return outputs
+
+def get_perturbation_results(span_length=10, n_perturbations=1, n_samples=100):
+    load_mask_model()
+
+    torch.manual_seed(0)
+    np.random.seed(0)
+
+    results = []
+    original_text = processed_data["original"]
+    sampled_text = processed_data["sampled"]
+
+    perturb_func = functools.partial(perturb_texts, span_length=span_length, pct=args.pct_words_masked)
+
+
 if __name__ == '__main__':
     logging.set_verbosity_warning()
     logging.enable_explicit_format
@@ -362,3 +420,8 @@ if __name__ == '__main__':
 
     base_outputs = baseline_outputs()
     save_temp_results(base_outputs)
+
+    if not args.baselines_only:
+        # run perturbation experiments
+        for n_perturbations in args.n_perturbation_list:
+            perturbation_results = get_perturbation_results(args.span_length, n_perturbations, n_samples=args.n_samples)
