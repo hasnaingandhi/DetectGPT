@@ -80,32 +80,6 @@ def load_base_model(base_model):
 
 
 
-def sample_from_model(texts, min_words=55, prompt_tokens=30):
-    encoded_text = base_tokenizer(texts, return_tensors="pt", padding=True).to(DEVICE)
-    encoded_text = {key: value[:, : prompt_tokens] for key,value in encoded_text.items()}
-    decoded_text = ['' for _ in range(len(texts))]
-
-    # sample from the model until we get a sample with at least min_words words for each example
-    # TODO this is an inefficient way to do this (since we regenerate for all inputs if just one is too short), but it works
-
-    tries = 0
-    while(m := min(len(x.split()) for x in decoded_text)) < min_words:
-        if tries != 0:
-            logger.warn(f"\nmin words: {m}, needed {min_words}, regenerating (try {tries})")
-        
-        sampling_kwargs = {}
-        # for top_k sampling
-        sampling_kwargs['top_k'] = TOP_K
-        min_length = 150
-        torch.cuda.empty_cache()
-        outputs = base_model.generate(**encoded_text, min_length=min_length, max_length=200, do_sample=True, **sampling_kwargs, pad_token_id=base_tokenizer.eos_token_id, eos_token_id=base_tokenizer.eos_token_id)
-        decoded_text = base_tokenizer.batch_decode(outputs, skip_special_tokens=True)
-        tries += 1
-
-    return decoded_text
-
-
-
 
 def compute_ll(text):
     # consider non-openai model
@@ -342,8 +316,8 @@ if __name__ == '__main__':
     torch.cuda.empty_cache()
 
     logger.warning(f'Loading dataset {args.dataset}...')
-    object_processed_data = loadingdata.Dataset(args, logger, MIN_EXAMPLE_WORDS, MODEL_MAX_LENGTH, SAVE_FOLDER_NAME)
-    processed_data = object_processed_data.dataset_generation(pre_tokenizer=pre_tokenizer)
+    object_processed_data = loadingdata.Dataset(args, logger, MIN_EXAMPLE_WORDS, MIN_WORDS_SAMPLED, MODEL_MAX_LENGTH, SAVE_FOLDER_NAME, DEVICE, pre_tokenizer, base_tokenizer, mask_model)
+    processed_data = object_processed_data.dataset_generation()
     torch.cuda.empty_cache()
     logger.warning("Dataset loaded")
 
