@@ -2,3 +2,18 @@
 results/
 tmp.py
 outputfile
+src/
+env/
+.vscode
+*.log
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.pyc
+
+# Distribution / packaging
+bin/
+build/
+
+run.sh
