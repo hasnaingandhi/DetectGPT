@@ -47,6 +47,7 @@ def setup_cache(args):
         os.makedirs(args.cache_dir)
     logger.info(f"Cache directory: {args.cache_dir}")
 
+
 if __name__ == '__main__':
     logging.set_verbosity_warning()
     logging.enable_explicit_format

@@ -47,6 +47,7 @@ class BaseModel:
             tries += 1
 
         return decoded_text
+
     
     def compute_ll(self, text):
         with torch.no_grad():

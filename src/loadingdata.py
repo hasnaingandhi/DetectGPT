@@ -16,6 +16,7 @@ class Dataset:
         self.batch_size = batch_size
 
     def get_data(self, pre_tokenizer, base_model, min_example_words, model_max_length, min_words_sampled):
+
         data = datasets.load_dataset(self.args.dataset, self.args.cache_dir, split="train")[self.args.dataset_key]
 
         # PREPROCESS
@@ -45,7 +46,6 @@ class Dataset:
         self.logger.warning(f"Avg number of words: {np.mean([len(x.split()) for x in data])}")
 
         return self.get_samples(data[:self.args.n_samples], base_model, min_words_sampled)
-
     
     def get_samples(self, raw, base_model, min_words_sampled):
         # torch.cuda.empty_cache()
@@ -60,7 +60,6 @@ class Dataset:
             self.logger.info(f"Generating samples for batch {batch} of {len(raw) // self.batch_size}")
             original = raw[batch * self.batch_size: (batch+1)*self.batch_size]
             sampled = base_model.sample_from_model(original, min_words=min_words_sampled)
-
             for o, s in zip(original, sampled):
                 o, s = utils.trim_to_shortest(o, s)
                 data["original"].append(o)
@@ -68,6 +67,7 @@ class Dataset:
 
         return data
 
+      
     def dataset_generation(self, pre_tokenizer, base_model, min_example_words, model_max_length, min_words_sampled):
         data = self.get_data(pre_tokenizer, base_model, min_example_words, model_max_length, min_words_sampled)
         if self.args.random_fills:
