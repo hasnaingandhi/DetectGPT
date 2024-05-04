@@ -12,7 +12,9 @@ import random
 import numpy as np
 import tqdm
 from sklearn.metrics import roc_curve, precision_recall_curve, auc
-
+import functools
+import utils
+import loadingdata
 
 API_TOKEN_COUNTER = 0
 DEVICE = "cuda"
@@ -22,12 +24,22 @@ TOP_K = 30
 SAVE_FOLDER_NAME = ''
 MIN_EXAMPLE_WORDS = 250
 
+
 def save_temp_results(data):
     # Open file in write mode
     with open(os.path.join(SAVE_FOLDER_NAME, "temp_data.json"), "w") as file:
         # Write each item in the dataset to the file
         json.dump(data, file)
 
+def load_mask_model():
+    logger.warning('Moving mask model to GPU...')
+    start = time.time()
+    # for non-openai models
+    base_model.cpu()
+    if not args.random_fills:
+        mask_model.to(DEVICE)
+    print(f'Done ({time.time() - start:.2f}s)')
+    
 def create_save_folder(args, start_time):
     base_model_name = args.base_model.replace('/', '_')
     save_folder_name = f"results/{args.output_name}{base_model_name}-{args.mask_filling_model}/{start_time}-{args.pct_words_masked}-{args.n_perturbation_list}-{args.dataset}-{args.n_samples}"
@@ -66,110 +78,7 @@ def load_base_model(base_model):
     base_model.to(DEVICE)
     logger.info(f'Done ({time.time() - start:.2f}s)')
 
-def trim_to_shortest(text1, text2):
-    shorter = min(len(text1.split(' ')), len(text2.split(' ')))
-    text1 = " ".join(text1.split(' ')[:shorter])
-    text2 = " ".join(text2.split(' ')[:shorter])
-    return text1, text2
 
-def sample_from_model(texts, min_words=55, prompt_tokens=30):
-    encoded_text = base_tokenizer(texts, return_tensors="pt", padding=True).to(DEVICE)
-    encoded_text = {key: value[:, : prompt_tokens] for key,value in encoded_text.items()}
-    decoded_text = ['' for _ in range(len(texts))]
-
-    # sample from the model until we get a sample with at least min_words words for each example
-    # TODO this is an inefficient way to do this (since we regenerate for all inputs if just one is too short), but it works
-
-    tries = 0
-    while(m := min(len(x.split()) for x in decoded_text)) < min_words:
-        if tries != 0:
-            logger.warn(f"\nmin words: {m}, needed {min_words}, regenerating (try {tries})")
-        
-        sampling_kwargs = {}
-        # for top_k sampling
-        sampling_kwargs['top_k'] = TOP_K
-        min_length = 150
-        torch.cuda.empty_cache()
-        outputs = base_model.generate(**encoded_text, min_length=min_length, max_length=200, do_sample=True, **sampling_kwargs, pad_token_id=base_tokenizer.eos_token_id, eos_token_id=base_tokenizer.eos_token_id)
-        decoded_text = base_tokenizer.batch_decode(outputs, skip_special_tokens=True)
-        tries += 1
-
-    return decoded_text
-
-def get_samples(raw, batch_size):
-    # torch.cuda.empty_cache()
-    # GENERATE SAMPLES
-    logger.info(f"Generating samples...")
-    torch.manual_seed(31)
-    np.random.seed(31)
-    data = {
-        "original": [],
-        "sampled": [],
-    }
-    for batch in range(len(raw) // batch_size):
-        logger.info(f"Generating samples for batch {batch} of {len(raw) // batch_size}")
-        original = raw[batch*batch_size: (batch+1)*batch_size]
-        sampled = sample_from_model(original, min_words=MIN_WORDS_SAMPLED)
-
-        for o, s in zip(original, sampled):
-            o, s = trim_to_shortest(o, s)
-            data["original"].append(o)
-            data["sampled"].append(s)
-
-    # TODO Introduce pre-perturbations
-
-    return data
-
-def get_data(dataset, key, pre_tokenizer, batch_size, cache_dir):
-    data = datasets.load_dataset(dataset, split="train", cache_dir=cache_dir)[key]
-
-    # PREPROCESS
-    # remove duplicates
-    data = list(dict.fromkeys(data))
-
-    # remove new lines
-    data = [' '.join(x.split()) for x in data]
-
-    # remove surrounding whitespace
-    data = [x.strip() for x in data]
-
-    # Keep sufficiently long examples
-    if dataset=='xsum' :
-        long_samples = [x for x in data if len(x.split()) > MIN_EXAMPLE_WORDS]
-        if len(long_samples) > 0:
-            data = long_samples
-
-    random.seed(1)
-    random.shuffle(data)
-    data = data[:1000]
-
-    tokenized_data = pre_tokenizer(data)
-    data = [x for x, y in zip(data, tokenized_data["input_ids"]) if len(y) <= MODEL_MAX_LENGTH]
-
-    logger.warning(f"Total number of samples: {len(data)}")
-    logger.warning(f"Avg number of words: {np.mean([len(x.split()) for x in data])}")
-
-    return get_samples(data[:args.n_samples], batch_size=batch_size)
-
-
-def load_dataset(dataset, dataset_key, pre_tokenizer, batch_size, cache_dir):
-    data = get_data(dataset,
-                    key=dataset_key,
-                    pre_tokenizer=pre_tokenizer,
-                    batch_size=args.batch_size,
-                    cache_dir=args.cache_dir)
-    if args.random_fills:
-        FILL_DICTIONARY = set()
-        for texts in data.values():
-            for text in texts:
-                FILL_DICTIONARY.update(text.split())
-        FILL_DICTIONARY = sorted(list(FILL_DICTIONARY))
-
-    with open(os.path.join(SAVE_FOLDER_NAME, "raw_data.json"), "w") as f:
-        logger.warning(f"Writing raw data to {os.path.join(SAVE_FOLDER_NAME, 'raw_data.json')}")
-        json.dump(data, f)
-    
-    return data
 
 
 def compute_ll(text):
@@ -269,6 +178,63 @@ def baseline_outputs():
         outputs.append(baseline_experiment(get_rank, "rank", n_samples=args.n_samples))
     return outputs
 
+def tokenize_and_mask(text, span_length, pct, ceil_pct=False):
+    tokens = text.split(' ')
+    mask_string = '<<<mask>>>'
+
+    n_spans = pct * len(tokens) / (span_length + args.buffer_size * 2)
+    if ceil_pct:
+        n_spans = np.ceil(n_spans)
+    n_spans = int(n_spans)
+
+    n_masks = 0
+    while n_masks < n_spans:
+        start = np.random.randint(0, len(tokens) - span_length)
+        end = start + span_length
+        search_start = max(0, start - args.buffer_size)
+        search_end = min(len(tokens, end + args.buffer_size))
+        if mask_string not in tokens[search_start:search_end]:
+            tokens[start:end] = [mask_string]
+            n_masks += 1
+
+    num_filled = 0
+    for idx, token in enumerate(tokens):
+        if token == mask_string:
+            tokens[idx] = f'<extra_id_{num_filled}>'
+            num_filled += 1
+    assert num_filled == n_masks, f"num_filled {num_filled} != n_masks {n_masks}"
+    text = ' '.join(tokens)
+    return text
+
+
+def apply_perturbations(texts, span_length, pct, ceil_pct):
+    if not args.random_fills:
+        masked_texts = [tokenize_and_mask(x, span_length, pct, ceil_pct) for x in texts]
+        raw_fills = replace_masks(masked_texts)
+        extracted_fills = extract_fills(raw_fills)
+        perturbed_texts = apply_extracted_fills(masked_texts, extracted_fills)
+
+
+def perturb_texts(texts, span_length, pct, ceil_pct=False):
+    outputs = []
+    for i in tqdm.tqdm(range(0, len(texts), args.chunk_size)):
+        logger.warning(f"Applying perturbations where number of perturbations = {n_perturbations}")
+        outputs.extend(apply_perturbations(texts[i:i + args.chunk_size], span_length, pct, ceil_pct=ceil_pct))
+        return outputs
+
+def get_perturbation_results(span_length=10, n_perturbations=1, n_samples=100):
+    load_mask_model()
+
+    torch.manual_seed(0)
+    np.random.seed(0)
+
+    results = []
+    original_text = processed_data["original"]
+    sampled_text = processed_data["sampled"]
+
+    perturb_func = functools.partial(perturb_texts, span_length=span_length, pct=args.pct_words_masked)
+
+
 if __name__ == '__main__':
     logging.set_verbosity_warning()
     logging.enable_explicit_format
@@ -350,15 +316,63 @@ if __name__ == '__main__':
     torch.cuda.empty_cache()
 
     logger.warning(f'Loading dataset {args.dataset}...')
-
-    processed_data = load_dataset(args.dataset,
-                                    args.dataset_key,
-                                    pre_tokenizer=pre_tokenizer,
-                                    batch_size=args.batch_size,
-                                    cache_dir=args.cache_dir
-                                    )
+    object_processed_data = loadingdata.Dataset(args, logger, MIN_EXAMPLE_WORDS, MIN_WORDS_SAMPLED, MODEL_MAX_LENGTH, SAVE_FOLDER_NAME, DEVICE, pre_tokenizer, base_tokenizer, mask_model)
+    processed_data = object_processed_data.dataset_generation()
     torch.cuda.empty_cache()
     logger.warning("Dataset loaded")
 
     base_outputs = baseline_outputs()
     save_temp_results(base_outputs)
+
+    if not args.baselines_only:
+        # run perturbation experiments
+        for n_perturbations in n_perturbation_list:
+            perturbation_results = get_perturbation_results(args.span_length, n_perturbations, n_samples)
+            for perturbation_mode in ['d', 'z']:
+                output = run_perturbation_experiment(
+                    perturbation_results, perturbation_mode, span_length=args.span_length, n_perturbations=n_perturbations, n_samples=n_samples)
+                outputs.append(output)
+                with open(os.path.join(SAVE_FOLDER, f"perturbation_{n_perturbations}_{perturbation_mode}_results.json"), "w") as f:
+                    json.dump(output, f)
+    torch.cuda.empty_cache()
+    
+    if not args.skip_baselines:
+        # write likelihood threshold results to a file
+        with open(os.path.join(SAVE_FOLDER, f"likelihood_threshold_results.json"), "w") as f:
+            json.dump(baseline_outputs[0], f)
+
+        if args.openai_model is None:
+            # write rank threshold results to a file
+            with open(os.path.join(SAVE_FOLDER, f"rank_threshold_results.json"), "w") as f:
+                json.dump(baseline_outputs[1], f)
+
+            # write log rank threshold results to a file
+            with open(os.path.join(SAVE_FOLDER, f"logrank_threshold_results.json"), "w") as f:
+                json.dump(baseline_outputs[2], f)
+
+            # write entropy threshold results to a file
+            with open(os.path.join(SAVE_FOLDER, f"entropy_threshold_results.json"), "w") as f:
+                json.dump(baseline_outputs[3], f)
+        
+        # write supervised results to a file
+        with open(os.path.join(SAVE_FOLDER, f"roberta-base-openai-detector_results.json"), "w") as f:
+            json.dump(baseline_outputs[-2], f)
+        
+        # write supervised results to a file
+        with open(os.path.join(SAVE_FOLDER, f"roberta-large-openai-detector_results.json"), "w") as f:
+            json.dump(baseline_outputs[-1], f)
+
+        outputs += baseline_outputs
+    torch.cuda.empty_cache()
+    save_roc_curves(outputs)
+    save_ll_histograms(outputs)
+    save_llr_histograms(outputs)
+    torch.cuda.empty_cache()
+
+    # move results folder from tmp_results/ to results/, making sure necessary directories exist
+    new_folder = SAVE_FOLDER.replace("tmp_results", "results")
+    if not os.path.exists(os.path.dirname(new_folder)):
+        os.makedirs(os.path.dirname(new_folder))
+    os.rename(SAVE_FOLDER, new_folder)
+    torch.cuda.empty_cache()
+    print(f"Used an *estimated* {API_TOKEN_COUNTER} API tokens (may be inaccurate)")
