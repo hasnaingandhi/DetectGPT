@@ -1,7 +1,8 @@
 import transformers
 import torch
 import time
-from torch.nn import functional
+import torch.nn.functional as func
+from transformers import BitsAndBytesConfig
 
 class BaseModel:
     def __init__(self, base_model_name, device, cache_dir, logger):
@@ -17,13 +18,13 @@ class BaseModel:
         self.logger.info("Moving Base Model to GPU...", end='', flush=True)
         start = time.time()
         try:
-            mask_model.cpu()
+            mask_model.model.cpu()
         except NameError:
             pass
         self.model.to(self.device)
         self.logger.warning(f'Done ({time.time() - start:.2f}s)')
 
-    def sample_from_base(self, texts, min_words=55, prompt_tokens=30, top_k=30):
+    def sample_from_model(self, texts, min_words=55, prompt_tokens=30, top_k=30):
         encoded_text = self.tokenizer(texts, return_tensors="pt", padding=True).to(self.device)
         encoded_text = {key: value[:, : prompt_tokens] for key,value in encoded_text.items()}
         decoded_text = ['' for _ in range(len(texts))]
@@ -81,8 +82,8 @@ class BaseModel:
         with torch.no_grad():
             tokenized = self.tokenizer(text, return_tensors="pt").to(self.device)
             logits = self.model(**tokenized).logits[:,:-1]
-            neg_entropy = functional.softmax(logits, dim=-1) * functional.log_softmax(logits, dim=-1)
-            return -neg_entropy.sum(-1).mean().item
+            neg_entropy = func.softmax(logits, dim=-1) * func.log_softmax(logits, dim=-1)
+            return -neg_entropy.sum(-1).mean().item()
 
  
 
@@ -92,11 +93,9 @@ class MaskModel:
         self.device = device
         self.cache_dir = cache_dir
         self.logger = logger
-        logger.warning(f'Loading mask filling model {mask_filling_model_name}')
+        logger.warning(f'Loading Mask filling model {mask_filling_model_name}')
+        quantization_config = BitsAndBytesConfig(load_in_8bit=True)
         self.model = transformers.AutoModelForSeq2SeqLM.from_pretrained(mask_filling_model_name,
-                                                                        torch_dtype=torch.bfloat16,
-                                                                        load_in_8bit=True,
-                                                                        device_map='auto',
                                                                         cache_dir=cache_dir)
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(mask_filling_model_name,
                                                                     model_max_length=model_max_length,
@@ -106,6 +105,6 @@ class MaskModel:
         self.logger.warning('Moving Mask Model to GPU')
         start = time.time()
 
-        base_model.cpu()
+        base_model.model.cpu()
         self.model.to(self.device)
         self.logger.warning(f'Done ({time.time() - start:.2f}s)')

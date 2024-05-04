@@ -2,21 +2,20 @@ import datasets
 import random
 import torch
 import numpy as np
-import tqdm
-import functools
-import transformers
-from transformers.utils import logging
+import json
+import os
+import utils
+
 
 
 class Dataset:
-    def __init__(self, args, logger, MIN_EXAMPLE_WORDS, MODEL_MAX_LENGTH, SAVE_FOLDER_NAME):
+    def __init__(self, args, logger, save_folder_name, batch_size):
         self.logger = logger
         self.args = args
-        self.MIN_EXAMPLE_WORDS = MIN_EXAMPLE_WORDS
-        self.MODEL_MAX_LENGTH = MODEL_MAX_LENGTH
-        self.SAVE_FOLDER_NAME = SAVE_FOLDER_NAME
+        self.save_folder_name = save_folder_name
+        self.batch_size = batch_size
 
-    def get_data(self, pre_tokenizer):
+    def get_data(self, pre_tokenizer, base_model, min_example_words, model_max_length, min_words_sampled):
         data = datasets.load_dataset(self.args.dataset, self.args.cache_dir, split="train")[self.args.dataset_key]
 
         # PREPROCESS
@@ -31,36 +30,36 @@ class Dataset:
 
         # Keep sufficiently long examples
         if self.args.dataset=='xsum' :
-            long_samples = [x for x in data if len(x.split()) > self.MIN_EXAMPLE_WORDS]
+            long_samples = [x for x in data if len(x.split()) > min_example_words]
             if len(long_samples) > 0:
                 data = long_samples
 
         random.seed(1)
         random.shuffle(data)
-        data = data[:1000]
+        data = data[:5000]
 
         tokenized_data = pre_tokenizer(data)
-        data = [x for x, y in zip(data, tokenized_data["input_ids"]) if len(y) <= self.MODEL_MAX_LENGTH]
+        data = [x for x, y in zip(data, tokenized_data["input_ids"]) if len(y) <= model_max_length]
 
         self.logger.warning(f"Total number of samples: {len(data)}")
         self.logger.warning(f"Avg number of words: {np.mean([len(x.split()) for x in data])}")
 
-        return self.get_samples(self, data[:self.args.n_samples])
+        return self.get_samples(data[:self.args.n_samples], base_model, min_words_sampled)
 
-    def get_samples(self, raw):
+    
+    def get_samples(self, raw, base_model, min_words_sampled):
         # torch.cuda.empty_cache()
-        # GENERATE SAMPLES
         self.logger.info(f"Generating samples...")
-        torch.manual_seed(31)
-        np.random.seed(31)
+        torch.manual_seed(30)
+        np.random.seed(30)
         data = {
             "original": [],
             "sampled": [],
         }
-        for batch in range(len(raw) // args.batch_size):
-            self.logger.info(f"Generating samples for batch {batch} of {len(raw) // args.batch_size}")
-            original = raw[batch*args.batch_size: (batch+1)*args.batch_size]
-            sampled = sample_from_model(original, min_words=self.args.MIN_WORDS_SAMPLED)
+        for batch in range(len(raw) // self.batch_size):
+            self.logger.info(f"Generating samples for batch {batch} of {len(raw) // self.batch_size}")
+            original = raw[batch * self.batch_size: (batch+1)*self.batch_size]
+            sampled = base_model.sample_from_model(original, min_words=min_words_sampled)
 
             for o, s in zip(original, sampled):
                 o, s = utils.trim_to_shortest(o, s)
@@ -69,8 +68,8 @@ class Dataset:
 
         return data
 
-    def dataset_generation(self, pre_tokenizer):
-        data = self.get_data(pre_tokenizer)
+    def dataset_generation(self, pre_tokenizer, base_model, min_example_words, model_max_length, min_words_sampled):
+        data = self.get_data(pre_tokenizer, base_model, min_example_words, model_max_length, min_words_sampled)
         if self.args.random_fills:
             FILL_DICTIONARY = set()
             for texts in data.values():
@@ -78,8 +77,8 @@ class Dataset:
                     FILL_DICTIONARY.update(text.split())
             FILL_DICTIONARY = sorted(list(FILL_DICTIONARY))
 
-        with open(os.path.join(self.SAVE_FOLDER_NAME, "raw_data.json"), "w") as f:
-            self.logger.warning(f"Writing raw data to {os.path.join(self.SAVE_FOLDER_NAME, 'raw_data.json')}")
+        with open(os.path.join(self.save_folder_name, "raw_data.json"), "w") as f:
+            self.logger.warning(f"Writing raw data to {os.path.join(self.save_folder_name, 'raw_data.json')}")
             json.dump(data, f)
         
         return data

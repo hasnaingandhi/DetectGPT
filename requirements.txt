@@ -6,3 +6,5 @@ matplotlib
 tqdm
 scikit-learn
 openai
+bitsandbytes -i https://pypi.org/simple/
+accelerate
